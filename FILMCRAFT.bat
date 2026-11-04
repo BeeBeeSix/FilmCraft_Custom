@@ -36,9 +36,6 @@ if not defined FILMCRAFT_CONTROL_TOKEN (
 echo Starting FilmCraft on port %FILMCRAFT_CONTROL_PORT% ...
 start "" /d "%FC_DIR%" "%FC_DIR%\%FC_EXE%" --control %FILMCRAFT_CONTROL_PORT%
 
-rem tool launcher (comment this line out if you do not want it)
-if exist "%SUPPORT%\cadcraft_launcher.py" start "" pythonw "%SUPPORT%\cadcraft_launcher.py"
-
 echo.
 echo Token: %FILMCRAFT_CONTROL_TOKEN%
 echo This window has the token set and Anaconda (base) active. Run FilmCraft scripts from here, e.g.
