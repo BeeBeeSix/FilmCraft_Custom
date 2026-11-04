@@ -41,5 +41,3 @@ echo Token: %FILMCRAFT_CONTROL_TOKEN%
 echo This window has the token set and Anaconda (base) active. Run FilmCraft scripts from here, e.g.
 echo     python filmcraft_slideshow_gui.py
 echo.
-cd /d "%SUPPORT%"
-cmd /k
