@@ -5,7 +5,6 @@ setlocal
 
 set "FC_DIR=C:\Program Files\ArtCraft\FilmCraft"
 set "FC_EXE=filmcraft.exe"
-set "SUPPORT=%APPDATA%\CADCraft\support"
 set "FILMCRAFT_CONTROL_PORT=9876"
 
 if not exist "%FC_DIR%\%FC_EXE%" (
