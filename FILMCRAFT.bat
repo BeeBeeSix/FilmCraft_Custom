@@ -36,6 +36,7 @@ if not defined FILMCRAFT_CONTROL_TOKEN (
 echo Starting FilmCraft on port %FILMCRAFT_CONTROL_PORT% ...
 start "" /d "%FC_DIR%" "%FC_DIR%\%FC_EXE%" --control %FILMCRAFT_CONTROL_PORT%
 
+
 echo.
 echo Token: %FILMCRAFT_CONTROL_TOKEN%
 echo This window has the token set and Anaconda (base) active. Run FilmCraft scripts from here, e.g.
