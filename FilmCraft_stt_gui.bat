@@ -24,6 +24,19 @@ if not exist "%CONDA_ACTIVATE%" (
 )
 call "%CONDA_ACTIVATE%"
 
+rem Ensure whisper-ctranslate2 is available
+where whisper-ctranslate2 >nul 2>&1
+if errorlevel 1 (
+    echo Installing whisper-ctranslate2 ...
+    python -m pip install whisper-ctranslate2
+    if errorlevel 1 (
+        echo Failed to install whisper-ctranslate2
+        pause
+        exit /b 1
+    )
+)
+
+
 rem 64 random hex characters, new every time
 set "FILMCRAFT_CONTROL_TOKEN="
 for /f %%i in ('python -c "import secrets; print(secrets.token_hex(32))"') do set "FILMCRAFT_CONTROL_TOKEN=%%i"
