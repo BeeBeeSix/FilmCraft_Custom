@@ -1,6 +1,7 @@
 """FilmCraft_Dictation_SRT.py - speak, get captions in FilmCraft.
 
-  1. Records your microphone.            (sounddevice)
+  1. Records your microphone, or whatever the speakers are playing (Windows loopback).
+                                           (sounddevice / PyAudioWPatch)
   2. Saves the recording as an MP3.      (lameenc, or ffmpeg if lameenc is missing)
   3. Transcribes it to an .srt.          (whisper-ctranslate2, GPU with --device cuda)
   4. Imports the .srt into FilmCraft     (captions.import over the control channel)
@@ -8,7 +9,9 @@
 
 One-time setup, in the Anaconda (base) window that FILMCRAFT.bat opens:
 
-    pip install sounddevice lameenc
+    pip install sounddevice lameenc PyAudioWPatch
+
+(PyAudioWPatch is only needed to record what comes out of the speakers.)
 
 Run it from that same window (it needs FILMCRAFT_CONTROL_TOKEN, and whisper-ctranslate2
 on PATH):
@@ -38,13 +41,18 @@ DEFAULT_OUT = HERE / "FilmCraft_Dictation"
 MIN_SECONDS = 0.5
 
 DEFAULTS = {
-    "input_device": "System default",
+    "input_device": "System default microphone",
     "outdir": "",                      # empty = <script folder>\FilmCraft_Dictation
     "exe": "whisper-ctranslate2",
     "model": "medium",
     "device": "cuda",
     "language": "",                    # empty = auto-detect
     "extra": "",
+    "split": True,                     # build the SRT from word timings
+    "pause": "0.5",                    # new caption after a gap this long (seconds)
+    "max_seconds": "6",                # ... or when a caption gets this long
+    "max_chars": "50",                 # ... or this many characters
+    "vad": True,                       # --vad_filter True
     "host": "127.0.0.1",
     "port": os.environ.get("FILMCRAFT_CONTROL_PORT", "9876"),
     "auto_import": True,
@@ -84,24 +92,24 @@ def fc_run(o, command, **params):
 # --------------------------------------------------------------------------
 # Audio helpers
 # --------------------------------------------------------------------------
-def write_wav(path, pcm, sr):
+def write_wav(path, pcm, sr, channels=1):
     with wave.open(str(path), "wb") as w:
-        w.setnchannels(1)
+        w.setnchannels(channels)
         w.setsampwidth(2)
         w.setframerate(sr)
         w.writeframes(pcm)
 
 
-def save_mp3(pcm, sr, mp3_path, log):
-    """16-bit mono PCM -> MP3. Returns the file actually written (WAV as a last resort)."""
+def save_mp3(pcm, sr, mp3_path, log, channels=1):
+    """16-bit interleaved PCM -> MP3. Returns the file actually written (WAV as a last resort)."""
     try:
         import lameenc
         enc = lameenc.Encoder()
         if hasattr(enc, "silence"):
             enc.silence()
-        enc.set_bit_rate(96)
+        enc.set_bit_rate(96 if channels == 1 else 128)
         enc.set_in_sample_rate(sr)
-        enc.set_channels(1)
+        enc.set_channels(channels)
         enc.set_quality(2)
         data = bytes(enc.encode(pcm)) + bytes(enc.flush())
         mp3_path.write_bytes(data)
@@ -112,7 +120,7 @@ def save_mp3(pcm, sr, mp3_path, log):
         log(f"lameenc failed ({exc}); trying ffmpeg ...")
 
     wav = mp3_path.with_suffix(".wav")
-    write_wav(wav, pcm, sr)
+    write_wav(wav, pcm, sr, channels)
     ff = shutil.which("ffmpeg")
     if ff:
         res = subprocess.run([ff, "-y", "-loglevel", "error", "-i", str(wav),
@@ -127,18 +135,100 @@ def save_mp3(pcm, sr, mp3_path, log):
     return wav
 
 
+def _ts(sec):
+    ms = int(round(max(0.0, sec) * 1000))
+    h, ms = divmod(ms, 3600000)
+    m, ms = divmod(ms, 60000)
+    s_, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s_:02d},{ms:03d}"
+
+
+def words_to_srt(data, pause, max_seconds, max_chars):
+    """Build SRT text from a whisper-ctranslate2 JSON result.
+
+    A new caption starts when the silence between two words is >= pause seconds,
+    when the caption would run longer than max_seconds, or longer than max_chars.
+    Falls back to whisper's own segments if the JSON has no word timings.
+    Returns (srt_text, caption_count, used_words).
+    """
+    words, segs = [], []
+    for seg in data.get("segments", []):
+        segs.append((float(seg.get("start", 0)), float(seg.get("end", 0)), str(seg.get("text", "")).strip()))
+        for w in seg.get("words") or []:
+            if w.get("start") is not None and w.get("end") is not None:
+                words.append((float(w["start"]), float(w["end"]), str(w.get("word", ""))))
+    caps = []
+    if words:
+        cur, c_start, c_end = "", None, None
+        for ws, we, wt in words:
+            token = wt.strip()
+            if not token:
+                continue
+            if cur:
+                too_long = (we - c_start) > max_seconds or len(cur) + 1 + len(token) > max_chars
+                if (ws - c_end) >= pause or too_long:
+                    caps.append((c_start, c_end, cur))
+                    cur, c_start = "", None
+            if not cur:
+                cur, c_start = token, ws
+            else:
+                cur += " " + token
+            c_end = we
+        if cur:
+            caps.append((c_start, c_end, cur))
+    else:
+        caps = [(a, b, t) for a, b, t in segs if t]
+    lines = []
+    for i, (a, b, t) in enumerate(caps, 1):
+        if b <= a:
+            b = a + 0.3
+        lines.append(f"{i}\n{_ts(a)} --> {_ts(b)}\n{t}\n")
+    return "\n".join(lines), len(caps), bool(words)
+
+
 def list_input_devices():
-    """[(label, device_index_or_None)] for the system default plus real inputs."""
-    import sounddevice as sd
-    out = [("System default", None)]
+    """-> (entries, hints). entries = [(label, (kind, ref))] with kind "mic" or "loop"."""
+    out, hints = [("System default microphone", ("mic", None))], []
     try:
-        host_api = sd.query_devices(kind="input")["hostapi"]
-    except Exception:
-        host_api = None
-    for i, d in enumerate(sd.query_devices()):
-        if d["max_input_channels"] > 0 and (host_api is None or d["hostapi"] == host_api):
-            out.append((f"{i}: {d['name']}", i))
-    return out
+        import sounddevice as sd
+        try:
+            host_api = sd.query_devices(kind="input")["hostapi"]
+        except Exception:
+            host_api = None
+        for i, d in enumerate(sd.query_devices()):
+            if d["max_input_channels"] > 0 and (host_api is None or d["hostapi"] == host_api):
+                out.append((f"Mic {i}: {d['name']}", ("mic", i)))
+    except ImportError:
+        hints.append("sounddevice is not installed (pip install sounddevice lameenc), "
+                     "so no microphones are listed.")
+    except Exception as exc:
+        hints.append(f"Could not list microphones: {exc}")
+    try:
+        import pyaudiowpatch as pa
+        pyaudio = pa.PyAudio()
+        try:
+            default_name = ""
+            try:
+                wasapi = pyaudio.get_host_api_info_by_type(pa.paWASAPI)
+                default_name = pyaudio.get_device_info_by_index(wasapi["defaultOutputDevice"])["name"]
+            except Exception:
+                pass
+            loops = []
+            for lb in pyaudio.get_loopback_device_info_generator():
+                is_default = bool(default_name) and default_name in lb["name"]
+                label = "Speakers: " + lb["name"].replace(" [Loopback]", "") + (" (default)" if is_default else "")
+                loops.append((not is_default, label, ("loop", dict(lb))))
+            for _, label, ref in sorted(loops, key=lambda t: t[0]):
+                out.append((label, ref))
+            if not loops:
+                hints.append("PyAudioWPatch found no speaker (loopback) devices.")
+        finally:
+            pyaudio.terminate()
+    except ImportError:
+        hints.append("To record what comes out of the speakers: pip install PyAudioWPatch (Windows only).")
+    except Exception as exc:
+        hints.append(f"Speaker capture is unavailable: {exc}")
+    return out, hints
 
 
 # --------------------------------------------------------------------------
@@ -148,7 +238,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("FilmCraft Dictation to SRT")
-        self.geometry("780x700")
+        self.geometry("780x760")
         self.cfg = dict(DEFAULTS)
         if CONFIG_FILE.exists():
             try:
@@ -164,9 +254,12 @@ class App(tk.Tk):
         self.chunks = []
         self.peak = 0.0
         self.rec_sr = 44100
+        self.rec_channels = 1
+        self.rec_kind = "mic"
+        self.pa = None
         self.rec_started = 0.0
         self.last_srt = None
-        self.device_map = {"System default": None}
+        self.device_map = {"System default microphone": ("mic", None)}
 
         c = self.cfg
         self.v_dev = tk.StringVar(value=c["input_device"])
@@ -176,6 +269,11 @@ class App(tk.Tk):
         self.v_device = tk.StringVar(value=c["device"])
         self.v_lang = tk.StringVar(value=c["language"])
         self.v_extra = tk.StringVar(value=c["extra"])
+        self.v_split = tk.BooleanVar(value=bool(c["split"]))
+        self.v_pause = tk.StringVar(value=str(c["pause"]))
+        self.v_maxsec = tk.StringVar(value=str(c["max_seconds"]))
+        self.v_maxchars = tk.StringVar(value=str(c["max_chars"]))
+        self.v_vad = tk.BooleanVar(value=bool(c["vad"]))
         self.v_host = tk.StringVar(value=c["host"])
         self.v_port = tk.StringVar(value=str(c["port"]))
         self.v_token = tk.StringVar(value=os.environ.get("FILMCRAFT_CONTROL_TOKEN", ""))
@@ -209,7 +307,7 @@ class App(tk.Tk):
         ttk.Label(root, text="1. Record", font=("", 11, "bold")).grid(
             row=r, column=0, columnspan=3, sticky="w", **pad)
         r += 1
-        ttk.Label(root, text="Microphone").grid(row=r, column=0, sticky="w", **pad)
+        ttk.Label(root, text="Audio source").grid(row=r, column=0, sticky="w", **pad)
         self.cb_dev = ttk.Combobox(root, textvariable=self.v_dev, state="readonly")
         self.cb_dev.grid(row=r, column=1, sticky="ew", **pad)
         ttk.Button(root, text="Refresh", command=self._refresh_devices).grid(row=r, column=2, **pad)
@@ -254,6 +352,17 @@ class App(tk.Tk):
         r += 1
         ttk.Label(root, text="Extra arguments").grid(row=r, column=0, sticky="w", **pad)
         ttk.Entry(root, textvariable=self.v_extra).grid(row=r, column=1, columnspan=2, sticky="ew", **pad)
+        r += 1
+        sp = ttk.Frame(root)
+        sp.grid(row=r, column=0, columnspan=3, sticky="ew")
+        ttk.Checkbutton(sp, text="Split on pauses", variable=self.v_split).pack(side="left", padx=6)
+        ttk.Label(sp, text="Pause >= (s)").pack(side="left", padx=(8, 2))
+        ttk.Entry(sp, textvariable=self.v_pause, width=5).pack(side="left")
+        ttk.Label(sp, text="Max secs").pack(side="left", padx=(8, 2))
+        ttk.Entry(sp, textvariable=self.v_maxsec, width=5).pack(side="left")
+        ttk.Label(sp, text="Max chars").pack(side="left", padx=(8, 2))
+        ttk.Entry(sp, textvariable=self.v_maxchars, width=5).pack(side="left")
+        ttk.Checkbutton(sp, text="Voice filter (VAD)", variable=self.v_vad).pack(side="left", padx=(14, 2))
         r += 1
         ttk.Label(root, text="Program").grid(row=r, column=0, sticky="w", **pad)
         ttk.Entry(root, textvariable=self.v_exe).grid(row=r, column=1, columnspan=2, sticky="ew", **pad)
@@ -344,6 +453,9 @@ class App(tk.Tk):
             "model": self.v_model.get().strip() or "medium",
             "device": self.v_device.get().strip() or "cuda",
             "language": self.v_lang.get().strip(), "extra": self.v_extra.get(),
+            "split": self.v_split.get(), "pause": self.v_pause.get().strip(),
+            "max_seconds": self.v_maxsec.get().strip(), "max_chars": self.v_maxchars.get().strip(),
+            "vad": self.v_vad.get(),
             "host": self.v_host.get().strip(), "port": self.v_port.get().strip(),
             "token": self.v_token.get().strip(), "auto": self.v_auto.get(),
             "replace": self.v_replace.get(), "shift": self.v_shift.get().strip(),
@@ -355,6 +467,9 @@ class App(tk.Tk):
             "input_device": self.v_dev.get(), "outdir": self.v_outdir.get(),
             "exe": self.v_exe.get(), "model": self.v_model.get(), "device": self.v_device.get(),
             "language": self.v_lang.get(), "extra": self.v_extra.get(),
+            "split": self.v_split.get(), "pause": self.v_pause.get(),
+            "max_seconds": self.v_maxsec.get(), "max_chars": self.v_maxchars.get(),
+            "vad": self.v_vad.get(),
             "host": self.v_host.get(), "port": self.v_port.get(),
             "auto_import": self.v_auto.get(), "replace_c1": self.v_replace.get(),
             "shift": self.v_shift.get(), "style": self.v_style.get(),
@@ -365,12 +480,7 @@ class App(tk.Tk):
             pass
 
     def _on_close(self):
-        if self.stream is not None:
-            try:
-                self.stream.abort()
-                self.stream.close()
-            except Exception:
-                pass
+        self._close_stream(abort=True)
         self._save_cfg()
         self.destroy()
 
@@ -393,21 +503,16 @@ class App(tk.Tk):
             self.log(f"Output folder: {d}")
 
     def _refresh_devices(self, first=False):
-        try:
-            devs = list_input_devices()
-        except ImportError:
-            self.log("sounddevice is not installed. In this window run:  pip install sounddevice lameenc")
-            return
-        except Exception as exc:
-            self.log(f"Could not list microphones: {exc}")
-            return
+        devs, hints = list_input_devices()
+        for h in hints:
+            self.log(h)
         self.device_map = dict(devs)
         names = [n for n, _ in devs]
         self.cb_dev.configure(values=names)
         if self.v_dev.get() not in self.device_map:
-            self.v_dev.set("System default")
+            self.v_dev.set(names[0])
         if not first:
-            self.log(f"{len(names) - 1} microphone(s) found.")
+            self.log(f"{len(names) - 1} audio source(s) found (microphones and speakers).")
 
     # ---- recording -------------------------------------------------------
     def on_toggle(self):
@@ -418,64 +523,115 @@ class App(tk.Tk):
         else:
             self._start_recording()
 
+    def _peak_of(self, b):
+        a = array("h")
+        a.frombytes(b[: len(b) - (len(b) % 2)])
+        return (max(map(abs, a)) / 32768.0) if len(a) else 0.0
+
     def _start_recording(self):
+        kind, ref = self.device_map.get(self.v_dev.get(), ("mic", None))
+        self.chunks = []
+        self.peak = 0.0
         try:
-            import sounddevice as sd
-        except ImportError:
-            self.log("sounddevice is not installed. In this window run:  pip install sounddevice lameenc")
+            if kind == "loop":
+                import pyaudiowpatch as pa
+                self.rec_kind = "loop"
+                self.rec_sr = int(ref["defaultSampleRate"])
+                self.rec_channels = int(ref["maxInputChannels"]) or 2
+                bytes_per_frame = 2 * self.rec_channels
+                t0 = time.monotonic()
+                state = {"frames": 0}
+
+                def loop_cb(in_data, frame_count, time_info, status):
+                    # WASAPI loopback sends nothing while the speakers are silent, which
+                    # would squeeze the timeline. Fill such gaps with silence.
+                    missing = int((time.monotonic() - t0) * self.rec_sr) - state["frames"] - frame_count
+                    if missing > 0.25 * self.rec_sr:
+                        self.chunks.append(b"\x00" * (missing * bytes_per_frame))
+                        state["frames"] += missing
+                    self.chunks.append(in_data)
+                    state["frames"] += frame_count
+                    self.peak = self._peak_of(in_data)
+                    return (None, pa.paContinue)
+
+                self.pa = pa.PyAudio()
+                self.stream = self.pa.open(format=pa.paInt16, channels=self.rec_channels,
+                                           rate=self.rec_sr, frames_per_buffer=2048, input=True,
+                                           input_device_index=ref["index"], stream_callback=loop_cb)
+                self.stream.start_stream()
+                what = f"speakers: {ref['name'].replace(' [Loopback]', '')}"
+                hint = "Play the audio now; press Stop when done."
+            else:
+                import sounddevice as sd
+                self.rec_kind = "mic"
+                info = sd.query_devices(ref, "input")
+                self.rec_sr = int(info["default_samplerate"])
+                self.rec_channels = 1
+
+                def mic_cb(indata, frames, t, status):
+                    b = bytes(indata)
+                    self.chunks.append(b)
+                    self.peak = self._peak_of(b)
+
+                self.stream = sd.RawInputStream(samplerate=self.rec_sr, channels=1, dtype="int16",
+                                                device=ref, callback=mic_cb)
+                self.stream.start()
+                what = f"microphone: {info['name']}"
+                hint = "Speak now; press Stop when done."
+        except ImportError as exc:
+            self.log(f"A needed package is missing ({exc}). In this window run:  "
+                     "pip install sounddevice lameenc PyAudioWPatch")
+            self._close_stream(abort=True)
             return
-        dev = self.device_map.get(self.v_dev.get())
-        try:
-            info = sd.query_devices(dev, "input")
-            self.rec_sr = int(info["default_samplerate"])
-            self.chunks = []
-            self.peak = 0.0
-
-            def callback(indata, frames, t, status):
-                b = bytes(indata)
-                self.chunks.append(b)
-                a = array("h")
-                a.frombytes(b)
-                self.peak = (max(map(abs, a)) / 32768.0) if len(a) else 0.0
-
-            self.stream = sd.RawInputStream(samplerate=self.rec_sr, channels=1, dtype="int16",
-                                            device=dev, callback=callback)
-            self.stream.start()
         except Exception as exc:
-            self.log(f"Could not open the microphone: {exc}")
-            self.stream = None
+            self.log(f"Could not open the audio source: {exc}")
+            self._close_stream(abort=True)
             return
         self.recording = True
         self.rec_started = time.time()
         self.btn_rec.configure(text="■  Stop")
-        self.log(f"Recording from: {info['name']} at {self.rec_sr} Hz. Speak now; press Stop when done.")
+        self.log(f"Recording from {what} at {self.rec_sr} Hz, {self.rec_channels} ch. {hint}")
+
+    def _close_stream(self, abort=False):
+        s_, self.stream = self.stream, None
+        pa_, self.pa = self.pa, None
+        try:
+            if s_ is not None:
+                if self.rec_kind == "loop":
+                    s_.stop_stream()
+                    s_.close()
+                else:
+                    (s_.abort if abort else s_.stop)()
+                    s_.close()
+        except Exception as exc:
+            self.log(f"Warning while stopping the audio: {exc}")
+        if pa_ is not None:
+            try:
+                pa_.terminate()
+            except Exception:
+                pass
 
     def _stop_and_process(self):
         self.recording = False
-        try:
-            self.stream.stop()
-            self.stream.close()
-        except Exception as exc:
-            self.log(f"Warning while stopping the microphone: {exc}")
-        self.stream = None
+        self._close_stream()
         pcm = b"".join(self.chunks)
         self.chunks = []
+        sr, ch = self.rec_sr, self.rec_channels
         self.btn_rec.configure(text="●  Record")
-        secs = len(pcm) / 2 / self.rec_sr
+        secs = len(pcm) / 2 / ch / sr
         if secs < MIN_SECONDS:
             self.log(f"That was only {secs:0.1f} s - nothing saved. Try again.")
             self.v_status.set("Ready.")
             return
         self._save_cfg()
         opts = self._snapshot()
-        sr = self.rec_sr
         self.working = True
         self.btn_rec.configure(state="disabled")
         self.v_status.set("Working...")
 
         def work():
             try:
-                self._pipeline(pcm, sr, opts)
+                self._pipeline(pcm, sr, ch, opts)
             except Exception as exc:
                 self.log(f"ERROR: {exc}")
             finally:
@@ -485,12 +641,12 @@ class App(tk.Tk):
         threading.Thread(target=work, daemon=True).start()
 
     # ---- pipeline --------------------------------------------------------
-    def _pipeline(self, pcm, sr, o):
+    def _pipeline(self, pcm, sr, ch, o):
         outdir = self._outdir(o)
         stamp = time.strftime("%Y%m%d_%H%M%S")
         self.status("Saving MP3...")
-        audio = save_mp3(pcm, sr, outdir / f"dictation_{stamp}.mp3", self.log)
-        self.log(f"Saved {audio}  ({len(pcm) / 2 / sr:0.1f} s of speech)")
+        audio = save_mp3(pcm, sr, outdir / f"dictation_{stamp}.mp3", self.log, ch)
+        self.log(f"Saved {audio}  ({len(pcm) / 2 / ch / sr:0.1f} s of audio)")
 
         self.status("Transcribing...")
         srt = self._transcribe(audio, outdir, o)
@@ -516,8 +672,20 @@ class App(tk.Tk):
         except ValueError as exc:
             self.log(f"Extra arguments could not be read: {exc}")
             return None
+        try:
+            pause = float(o["pause"] or 0.5)
+            max_s = float(o["max_seconds"] or 6)
+            max_c = int(float(o["max_chars"] or 50))
+        except ValueError:
+            self.log("Pause, Max secs and Max chars must be numbers.")
+            return None
+        fmt = "json" if o["split"] else "srt"
         cmd = [exe, str(audio), "--model", o["model"], "--device", o["device"],
-               "--output_format", "srt", "--output_dir", str(outdir)]
+               "--output_format", fmt, "--output_dir", str(outdir)]
+        if o["split"]:
+            cmd += ["--word_timestamps", "True"]
+        if o["vad"]:
+            cmd += ["--vad_filter", "True"]
         if o["language"]:
             cmd += ["--language", o["language"]]
         cmd += extra
@@ -536,6 +704,23 @@ class App(tk.Tk):
         srt = Path(audio).with_suffix(".srt")
         if code != 0:
             self.log(f"whisper-ctranslate2 exited with code {code}.")
+        if o["split"]:
+            js = Path(audio).with_suffix(".json")
+            if not js.exists() or js.stat().st_mtime < t0 - 2:
+                self.log("No .json came back from whisper-ctranslate2. Check the messages above.")
+                return None
+            try:
+                text, n, used_words = words_to_srt(json.loads(js.read_text(encoding="utf-8")),
+                                                   pause, max_s, max_c)
+            except (ValueError, KeyError, TypeError) as exc:
+                self.log(f"Could not read the word timings in {js.name}: {exc}")
+                return None
+            if not n:
+                self.log("Whisper heard no speech, so there are no captions.")
+                return None
+            srt.write_text(text, encoding="utf-8")
+            self.log(f"Split into {n} captions on pauses >= {pause:g} s"
+                     + ("" if used_words else " (no word timings found, used Whisper's own segments)"))
         if not srt.exists() or srt.stat().st_mtime < t0 - 2:
             self.log("No .srt was produced. Check the messages above.")
             return None
