@@ -1,3 +1,6 @@
+FilmCraft_Dictation_SRT
+<img width="1995" height="1139" alt="image" src="https://github.com/user-attachments/assets/d5f46b22-ed33-4cab-8458-dd37c8376948" />
+
 Still2Video Python Tool
 <img width="2556" height="1541" alt="image" src="https://github.com/user-attachments/assets/edd2e722-dc3c-4a8a-bdd3-c4d130425bbb" />
 
