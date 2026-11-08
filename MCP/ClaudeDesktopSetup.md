@@ -1,6 +1,6 @@
 # FilmCraft + Claude Desktop Setup
 
-Connects Claude Desktop to FilmCraft through the FilmCraft MCP bridge, using the two files in `MCP.zip`:
+Connects Claude Desktop to FilmCraft through the FilmCraft MCP bridge, using the two files required:
 
 | File | Role |
 |---|---|
@@ -24,10 +24,9 @@ If any path differs on your machine, change it in step 3.
 
 ## 2. Install the files
 
-1. Extract `MCP.zip`.
-2. Put `FILMCRAFT.bat` and `fc_desktop_cfg.py` **in the same folder**, anywhere you like (for example `C:\Tools\MCP\`). The `.bat` finds the script via `%~dp0`, so they must stay together.
+1. Put `FILMCRAFT.bat` and `fc_desktop_cfg.py` **in the same folder**, anywhere you like (for example `C:\Tools\MCP\`). The `.bat` finds the script via `%~dp0`, so they must stay together.
 
-## 3. Check the settings at the top of `FILMCRAFT.bat`
+## 2. Check the settings at the top of `FILMCRAFT.bat`
 
 Open it in a text editor and confirm:
 
