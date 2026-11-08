@@ -77,4 +77,3 @@ echo The dictation tool has closed. This window still has the token set. To run 
 echo     python "%~dp0FilmCraft_Dictation_SRT.py"
 echo.
 cmd /k
-
