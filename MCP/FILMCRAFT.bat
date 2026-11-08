@@ -1,7 +1,7 @@
 @echo off
-rem FILMCRAFT.bat - start FilmCraft with a fresh control token, register the
-rem FilmCraft MCP bridge with Claude using that same token, and leave a prompt
-rem open that shares the token.
+rem FILMCRAFT.bat - start FilmCraft with a persistent control token (created on
+rem first run, saved next to this file), register the FilmCraft MCP bridge with
+rem Claude using that same token, and leave a prompt open that shares the token.
 setlocal
 
 set "FC_DIR=C:\Program Files\ArtCraft\FilmCraft"
@@ -34,14 +34,20 @@ if not exist "%CONDA_ACTIVATE%" (
 )
 call "%CONDA_ACTIVATE%"
 
-rem 64 random hex characters, new every time
+rem 64 random hex characters, generated once and reused from .filmcraft_token
+rem (delete that file to force a new token)
+set "TOKEN_FILE=%~dp0.filmcraft_token"
 set "FILMCRAFT_CONTROL_TOKEN="
-for /f %%i in ('python -c "import secrets; print(secrets.token_hex(32))"') do set "FILMCRAFT_CONTROL_TOKEN=%%i"
+set "TOKEN_IS_NEW=0"
+if exist "%TOKEN_FILE%" set /p FILMCRAFT_CONTROL_TOKEN=<"%TOKEN_FILE%"
+if not defined FILMCRAFT_CONTROL_TOKEN set "TOKEN_IS_NEW=1"
+if "%TOKEN_IS_NEW%"=="1" for /f %%i in ('python -c "import secrets; print(secrets.token_hex(32))"') do set "FILMCRAFT_CONTROL_TOKEN=%%i"
 if not defined FILMCRAFT_CONTROL_TOKEN (
     echo Could not make a token. Is python available after the Anaconda activation?
     pause
     exit /b 1
 )
+if "%TOKEN_IS_NEW%"=="1" >"%TOKEN_FILE%" echo %FILMCRAFT_CONTROL_TOKEN%
 
 echo Starting FilmCraft on port %FILMCRAFT_CONTROL_PORT% ...
 start "" /d "%FC_DIR%" "%FC_DIR%\%FC_EXE%" --control %FILMCRAFT_CONTROL_PORT%
@@ -72,7 +78,11 @@ if "%HAVE_CLI%"=="1" if "%REG_CLAUDE_DESKTOP%"=="1" (
     echo.
     echo Updating Claude Desktop config ...
     python "%~dp0fc_desktop_cfg.py" "%FC_DIR%\%FC_CLI%" %FILMCRAFT_CONTROL_PORT% %FILMCRAFT_CONTROL_TOKEN%
-    echo Fully quit and reopen Claude Desktop to pick up the new token.
+    if "%TOKEN_IS_NEW%"=="1" (
+        echo New token created. Fully quit and reopen Claude Desktop to pick it up.
+    ) else (
+        echo Reusing saved token - Claude Desktop does not need a restart for FilmCraft restarts.
+    )
 )
 
 echo.
