@@ -1,3 +1,6 @@
+FilmCraft_stt_gui    (Speech to text via Files)
+<img width="800" height="750" alt="image" src="https://github.com/user-attachments/assets/54bc3896-5ddc-49ab-9171-57398fc4c6b2" />
+
 FilmCraft_Dictation_SRT
 <img width="1995" height="1139" alt="image" src="https://github.com/user-attachments/assets/d5f46b22-ed33-4cab-8458-dd37c8376948" />
 
