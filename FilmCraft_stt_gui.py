@@ -2,7 +2,9 @@
 
 1. Transcribes an audio/video file (or every media file in a folder) to .srt with
    whisper-ctranslate2 (faster-whisper CLI), on the GPU if you choose cuda.
-2. Sends the .srt to the running FilmCraft app over the control channel.
+   Captions can be split on pauses (from word timings) instead of Whisper's own segments.
+2. Sends the .srt to FilmCraft with captions.import, optionally replacing the C1 caption
+   track first and shifting the captions in time.
 
 Run it from the window opened by FILMCRAFT.bat, so that it inherits
 FILMCRAFT_CONTROL_TOKEN / FILMCRAFT_CONTROL_PORT and the Anaconda (base)
@@ -23,10 +25,17 @@ import threading
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, ttk
+from tkinter import colorchooser, filedialog, ttk
+from tkinter import font as tkfont
 
 CONFIG_FILE = Path(__file__).with_name("filmcraft_stt_gui.json")
 MEDIA_EXTS = ("mp4", "mov", "mkv", "wav", "mp3", "m4a")
+FONT_STYLES = ["Regular", "Medium", "SemiBold", "Bold", "Italic", "Bold Italic"]
+# Starting values for the caption style panel (they mirror FilmCraft's own style controls).
+STYLE_DEFAULTS = dict(font="Inter", fontStyle="SemiBold", size="54", color="#ffffff",
+                      outline="2", outlineColor="#000000", background=False,
+                      backgroundColor="#000000", bgOpacity="60", align="center",
+                      anchor="bottom", margin="0.08", lineSpacing="1.0")
 CAPTION_WORDS = ("srt", "caption", "subtitle", "transcri")
 
 DEFAULTS = {
@@ -35,14 +44,24 @@ DEFAULTS = {
     "device": "cuda",
     "language": "",          # empty = auto-detect
     "extra": "",             # extra whisper-ctranslate2 arguments, appended as-is
+    "split": True,           # build the SRT from word timings (split on pauses)
+    "pause": "0.5",          # new caption after a gap this long (seconds)
+    "max_seconds": "6",      # ... or when a caption gets this long
+    "max_chars": "50",       # ... or this many characters
+    "vad": False,            # --vad_filter True (skip non-speech)
     "media": "",
     "outdir": "",            # empty = <media folder>\FilmCraft_Captions
     "srt": "",
     "host": "127.0.0.1",
     "port": os.environ.get("FILMCRAFT_CONTROL_PORT", "9876"),
-    "import_command": "",
-    # {srt} is replaced with the SRT path; rename the key to match the command's param.
-    "import_params": '{"path": "{srt}"}',
+    "import_command": "captions.import",
+    # {srt} = the SRT path, {stem} = its file name without extension.
+    "import_params": '{"path": "{srt}", "name": "{stem}"}',
+    "replace_c1": True,      # delete caption track C1 before importing
+    "shift": "0",            # move all imported captions by this many seconds (can be negative)
+    "style_on": False,       # send captions.setStyle after importing, using the style panel
+    "style_json": "",        # optional extra captions.setStyle fields, e.g. {"size": 48}
+    "style": dict(STYLE_DEFAULTS),
 }
 
 
@@ -100,6 +119,72 @@ def fill(value, mapping):
     return value
 
 
+def style_params(v):
+    """captions.setStyle parameters from the panel values (same as filmcraft_subtitles_gui.py)."""
+    p = {"font": v["font"], "fontStyle": v["fontStyle"],
+         "size": float(v["size"]), "color": v["color"],
+         "align": v["align"], "anchor": v["anchor"],
+         "margin": max(0.0, min(0.45, float(v["margin"]))),
+         "lineSpacing": float(v["lineSpacing"]),
+         "outline": float(v["outline"]), "outlineColor": v["outlineColor"],
+         "background": bool(v["background"])}
+    if v["background"]:  # box colour is sent as #rrggbbaa
+        a = int(round(max(0.0, min(100.0, float(v["bgOpacity"]))) * 2.55))
+        p["backgroundColor"] = v["backgroundColor"].lstrip("#")[:6].join(("#", "%02x" % a))
+    return p
+
+
+def _ts(sec):
+    ms = int(round(max(0.0, sec) * 1000))
+    h, ms = divmod(ms, 3600000)
+    m, ms = divmod(ms, 60000)
+    s_, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s_:02d},{ms:03d}"
+
+
+def words_to_srt(data, pause, max_seconds, max_chars):
+    """Build SRT text from a whisper-ctranslate2 JSON result.
+
+    A new caption starts when the silence between two words is >= pause seconds,
+    when the caption would run longer than max_seconds, or longer than max_chars.
+    Falls back to whisper's own segments if the JSON has no word timings.
+    Returns (srt_text, caption_count, used_words).
+    """
+    words, segs = [], []
+    for seg in data.get("segments", []):
+        segs.append((float(seg.get("start", 0)), float(seg.get("end", 0)), str(seg.get("text", "")).strip()))
+        for w in seg.get("words") or []:
+            if w.get("start") is not None and w.get("end") is not None:
+                words.append((float(w["start"]), float(w["end"]), str(w.get("word", ""))))
+    caps = []
+    if words:
+        cur, c_start, c_end = "", None, None
+        for ws, we, wt in words:
+            token = wt.strip()
+            if not token:
+                continue
+            if cur:
+                too_long = (we - c_start) > max_seconds or len(cur) + 1 + len(token) > max_chars
+                if (ws - c_end) >= pause or too_long:
+                    caps.append((c_start, c_end, cur))
+                    cur, c_start = "", None
+            if not cur:
+                cur, c_start = token, ws
+            else:
+                cur += " " + token
+            c_end = we
+        if cur:
+            caps.append((c_start, c_end, cur))
+    else:
+        caps = [(a, b, t) for a, b, t in segs if t]
+    lines = []
+    for i, (a, b, t) in enumerate(caps, 1):
+        if b <= a:
+            b = a + 0.3
+        lines.append(f"{i}\n{_ts(a)} --> {_ts(b)}\n{t}\n")
+    return "\n".join(lines), len(caps), bool(words)
+
+
 # --------------------------------------------------------------------------
 # GUI
 # --------------------------------------------------------------------------
@@ -107,7 +192,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("FilmCraft - Speech to Text")
-        self.geometry("820x700")
+        self.geometry("860x960")
         self.cfg = dict(DEFAULTS)
         if CONFIG_FILE.exists():
             try:
@@ -115,6 +200,11 @@ class App(tk.Tk):
                 self.cfg.update({k: v for k, v in saved.items() if k in DEFAULTS})
             except Exception:
                 pass
+        for key in ("import_command", "import_params"):
+            if not str(self.cfg.get(key, "")).strip():
+                self.cfg[key] = DEFAULTS[key]
+        saved_style = self.cfg.get("style")
+        self.cfg["style"] = {**STYLE_DEFAULTS, **(saved_style if isinstance(saved_style, dict) else {})}
 
         self.log_q = queue.Queue()
         self.busy = False
@@ -127,6 +217,11 @@ class App(tk.Tk):
         self.v_device = tk.StringVar(value=c["device"])
         self.v_lang = tk.StringVar(value=c["language"])
         self.v_extra = tk.StringVar(value=c["extra"])
+        self.v_split = tk.BooleanVar(value=bool(c["split"]))
+        self.v_pause = tk.StringVar(value=str(c["pause"]))
+        self.v_maxsec = tk.StringVar(value=str(c["max_seconds"]))
+        self.v_maxchars = tk.StringVar(value=str(c["max_chars"]))
+        self.v_vad = tk.BooleanVar(value=bool(c["vad"]))
         self.v_media = tk.StringVar(value=c["media"])
         self.v_outdir = tk.StringVar(value=c["outdir"])
         self.v_srt = tk.StringVar(value=c["srt"])
@@ -135,6 +230,12 @@ class App(tk.Tk):
         self.v_token = tk.StringVar(value=os.environ.get("FILMCRAFT_CONTROL_TOKEN", ""))
         self.v_cmd = tk.StringVar(value=c["import_command"])
         self.v_params = tk.StringVar(value=c["import_params"])
+        self.v_replace = tk.BooleanVar(value=bool(c["replace_c1"]))
+        self.v_shift = tk.StringVar(value=str(c["shift"]))
+        self.v_style_on = tk.BooleanVar(value=bool(c["style_on"]))
+        self.v_style_json = tk.StringVar(value=c["style_json"])
+        self.v_st = {k: (tk.BooleanVar(value=bool(v)) if k == "background" else tk.StringVar(value=str(v)))
+                     for k, v in c["style"].items()}
 
         self._build()
         self.after(100, self._drain_log)
@@ -185,6 +286,17 @@ class App(tk.Tk):
         ttk.Label(root, text="Extra arguments").grid(row=r, column=0, sticky="w", **pad)
         ttk.Entry(root, textvariable=self.v_extra).grid(row=r, column=1, columnspan=2, sticky="ew", **pad)
         r += 1
+        sp = ttk.Frame(root)
+        sp.grid(row=r, column=0, columnspan=3, sticky="ew")
+        ttk.Checkbutton(sp, text="Split on pauses", variable=self.v_split).pack(side="left", padx=6)
+        ttk.Label(sp, text="Pause >= (s)").pack(side="left", padx=(8, 2))
+        ttk.Entry(sp, textvariable=self.v_pause, width=5).pack(side="left")
+        ttk.Label(sp, text="Max secs").pack(side="left", padx=(8, 2))
+        ttk.Entry(sp, textvariable=self.v_maxsec, width=5).pack(side="left")
+        ttk.Label(sp, text="Max chars").pack(side="left", padx=(8, 2))
+        ttk.Entry(sp, textvariable=self.v_maxchars, width=5).pack(side="left")
+        ttk.Checkbutton(sp, text="Voice filter (VAD)", variable=self.v_vad).pack(side="left", padx=(14, 2))
+        r += 1
         ttk.Label(root, text="Program").grid(row=r, column=0, sticky="w", **pad)
         ttk.Entry(root, textvariable=self.v_exe).grid(row=r, column=1, columnspan=2, sticky="ew", **pad)
         r += 1
@@ -211,7 +323,7 @@ class App(tk.Tk):
         ttk.Button(conn, text="Test connection", command=self.on_test).grid(row=0, column=6, **pad)
         r += 1
         ttk.Label(root, text="Import command").grid(row=r, column=0, sticky="w", **pad)
-        self.cb_cmd = ttk.Combobox(root, textvariable=self.v_cmd)
+        self.cb_cmd = ttk.Combobox(root, textvariable=self.v_cmd, values=("captions.import",))
         self.cb_cmd.grid(row=r, column=1, sticky="ew", **pad)
         self.cb_cmd.bind("<<ComboboxSelected>>", self._on_cmd_selected)
         ttk.Button(root, text="Find caption commands", command=self.on_find).grid(row=r, column=2, **pad)
@@ -219,8 +331,54 @@ class App(tk.Tk):
         ttk.Label(root, text="Command params").grid(row=r, column=0, sticky="w", **pad)
         ttk.Entry(root, textvariable=self.v_params).grid(row=r, column=1, columnspan=2, sticky="ew", **pad)
         r += 1
-        ttk.Label(root, text="JSON; {srt} becomes the SRT path. Rename the key to match the command's param.",
+        ttk.Label(root, text="JSON; {srt} = the SRT path, {stem} = its file name. Rename keys to match the command.",
                   foreground="gray").grid(row=r, column=1, columnspan=2, sticky="w", padx=6)
+        r += 1
+        imp = ttk.Frame(root)
+        imp.grid(row=r, column=0, columnspan=3, sticky="ew")
+        ttk.Checkbutton(imp, text="Replace caption track C1", variable=self.v_replace).pack(side="left", padx=6)
+        ttk.Label(imp, text="Shift (s)").pack(side="left", padx=(12, 2))
+        ttk.Entry(imp, textvariable=self.v_shift, width=7).pack(side="left")
+
+        r += 1
+        sf = ttk.LabelFrame(root, text="Caption style (captions.setStyle)", padding=6)
+        sf.grid(row=r, column=0, columnspan=3, sticky="ew", padx=6, pady=4)
+        top = ttk.Frame(sf)
+        top.grid(row=0, column=0, columnspan=6, sticky="w")
+        ttk.Checkbutton(top, text="Apply this style after importing",
+                        variable=self.v_style_on).pack(side="left")
+        ttk.Button(top, text="Apply to track C1 now", command=self.on_apply_style).pack(side="left", padx=14)
+
+        def cell(row, col, label, widget):
+            ttk.Label(sf, text=label).grid(row=row, column=col * 2, sticky="w", padx=(0, 4), pady=2)
+            widget.grid(row=row, column=col * 2 + 1, sticky="w", padx=(0, 12), pady=2)
+
+        st = self.v_st
+        families = sorted(set(tkfont.families(self)), key=str.lower)
+        cell(1, 0, "Font", ttk.Combobox(sf, textvariable=st["font"], values=families, width=18))
+        cell(1, 1, "Weight", ttk.Combobox(sf, textvariable=st["fontStyle"], values=FONT_STYLES,
+                                          width=11, state="readonly"))
+        cell(1, 2, "Size (px)", ttk.Spinbox(sf, textvariable=st["size"], from_=8, to=300, width=6))
+        cell(2, 0, "Text colour", self._colour_widget(sf, "color"))
+        cell(2, 1, "Outline", ttk.Spinbox(sf, textvariable=st["outline"], from_=0, to=20,
+                                          increment=0.5, width=6))
+        cell(2, 2, "Outline colour", self._colour_widget(sf, "outlineColor"))
+        cell(3, 0, "Box", ttk.Checkbutton(sf, variable=st["background"]))
+        cell(3, 1, "Box colour", self._colour_widget(sf, "backgroundColor"))
+        cell(3, 2, "Box opacity %", ttk.Spinbox(sf, textvariable=st["bgOpacity"], from_=0, to=100, width=6))
+        cell(4, 0, "Align", ttk.Combobox(sf, textvariable=st["align"], values=["left", "center", "right"],
+                                         width=8, state="readonly"))
+        cell(4, 1, "Position", ttk.Combobox(sf, textvariable=st["anchor"], values=["top", "middle", "bottom"],
+                                            width=8, state="readonly"))
+        cell(4, 2, "Edge margin", ttk.Entry(sf, textvariable=st["margin"], width=6))
+        cell(5, 0, "Line spacing", ttk.Spinbox(sf, textvariable=st["lineSpacing"], from_=0.5, to=3.0,
+                                               increment=0.1, width=6))
+        ttk.Label(sf, text="Style JSON").grid(row=6, column=0, sticky="w", pady=(6, 2))
+        ttk.Entry(sf, textvariable=self.v_style_json).grid(row=6, column=1, columnspan=5, sticky="ew", pady=(6, 2))
+        ttk.Label(sf, wraplength=700, foreground="gray", text=(
+            'Optional extra fields for captions.setStyle, e.g. {"size": 48, "outline": 2}. They are '
+            "added on top of the panel (and sent even if the panel is off). Blank = nothing extra."
+        )).grid(row=7, column=1, columnspan=5, sticky="w")
 
         r += 1
         ttk.Separator(root).grid(row=r, column=0, columnspan=3, sticky="ew", pady=8)
@@ -276,6 +434,11 @@ class App(tk.Tk):
             "media": self.v_media.get(), "outdir": self.v_outdir.get(), "srt": self.v_srt.get(),
             "host": self.v_host.get(), "port": self.v_port.get(),
             "import_command": self.v_cmd.get(), "import_params": self.v_params.get(),
+            "split": self.v_split.get(), "pause": self.v_pause.get(),
+            "max_seconds": self.v_maxsec.get(), "max_chars": self.v_maxchars.get(),
+            "vad": self.v_vad.get(), "replace_c1": self.v_replace.get(), "shift": self.v_shift.get(),
+            "style_on": self.v_style_on.get(), "style_json": self.v_style_json.get(),
+            "style": {k: v.get() for k, v in self.v_st.items()},
         }  # the token is never written to disk
         try:
             CONFIG_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -309,6 +472,60 @@ class App(tk.Tk):
             title="Choose an .srt", filetypes=[("SubRip", "*.srt"), ("All files", "*.*")])
         if p:
             self.v_srt.set(os.path.normpath(p))
+
+    def _colour_widget(self, parent, key):
+        var = self.v_st[key]
+        f = ttk.Frame(parent)
+        ttk.Entry(f, textvariable=var, width=9).pack(side="left")
+        sw = tk.Label(f, width=3, relief="solid", borderwidth=1)
+        sw.pack(side="left", padx=3)
+
+        def pick():
+            try:
+                c = colorchooser.askcolor(color=var.get(), parent=self)[1]
+            except tk.TclError:  # the entry did not hold a valid colour
+                c = colorchooser.askcolor(parent=self)[1]
+            if c:
+                var.set(c)
+
+        def paint(*_):
+            try:
+                sw.configure(bg=var.get())
+            except tk.TclError:
+                pass
+        ttk.Button(f, text="...", width=3, command=pick).pack(side="left")
+        var.trace_add("write", paint)
+        paint()
+        return f
+
+    def _style_to_send(self, force_panel=False):
+        """captions.setStyle parameters from the panel and/or the JSON field, or None."""
+        style = {}
+        if force_panel or self.v_style_on.get():
+            style.update(style_params({k: v.get() for k, v in self.v_st.items()}))
+        txt = self.v_style_json.get().strip()
+        if txt:
+            extra = json.loads(txt)
+            if not isinstance(extra, dict):
+                raise ValueError('Style JSON must be an object like {"size": 48}')
+            style.update(extra)
+        return style or None
+
+    def on_apply_style(self):
+        def work():
+            try:
+                style = self._style_to_send(force_panel=True)
+            except ValueError as exc:
+                self.log(f"Check the style fields: {exc}")
+                return
+            try:
+                res = self._fc("captions.setStyle", track="C1", **style)
+                self.log("Styled track C1: " + json.dumps(res, separators=(",", ":"))[:200])
+            except RuntimeError as exc:
+                self.log(f"FilmCraft refused it: {exc}")
+            except OSError as exc:
+                self.log(f"Could not reach FilmCraft: {exc}")
+        self._run_thread(work)
 
     def _on_cmd_selected(self, _event=None):
         cid = self.v_cmd.get()
@@ -372,28 +589,78 @@ class App(tk.Tk):
                 self.log("No command mentions srt/caption/subtitle. The full list is in the dropdown.")
         self._run_thread(work)
 
+    def _fc(self, command, **params):
+        """Run one FilmCraft command; return its result or raise RuntimeError."""
+        host, port, token = self._conn()
+        reply = fc_call(host, port, token, "engine.execute", {"command": command, "params": params})
+        if not reply.get("ok"):
+            raise RuntimeError(reply.get("error") or "FilmCraft reported an error")
+        return reply.get("result")
+
     def _send_work(self, srt=None):
         srt = str(srt or self.v_srt.get()).strip()
         if not srt or not Path(srt).exists():
             self.log("No SRT file yet. Transcribe first, or Browse to an existing .srt.")
             return False
-        cmd_id = self.v_cmd.get().strip()
-        if not cmd_id:
-            self.log("Click 'Find caption commands' and choose the import command first.")
-            return False
+        cmd_id = self.v_cmd.get().strip() or "captions.import"
         try:
-            params = fill(json.loads(self.v_params.get() or "{}"), {"srt": str(Path(srt).resolve())})
-        except json.JSONDecodeError as exc:
-            self.log(f"Command params is not valid JSON: {exc}")
+            params = fill(json.loads(self.v_params.get() or "{}"),
+                          {"srt": str(Path(srt).resolve()), "stem": Path(srt).stem})
+            shift_s = float(self.v_shift.get().strip() or 0)
+            style = self._style_to_send()
+        except ValueError as exc:  # bad JSON, a non-numeric shift or a bad style value
+            self.log(f"Check 'Command params' (JSON), 'Shift' and the style fields: {exc}")
             return False
-        host, port, token = self._conn()
-        self.log(f"Sending to FilmCraft: {cmd_id} {json.dumps(params)}")
-        reply = fc_call(host, port, token, "engine.execute", {"command": cmd_id, "params": params})
-        if reply.get("ok"):
-            self.log(f"FilmCraft: OK {json.dumps(reply.get('result'))[:500]}")
+        host, port, _ = self._conn()
+        try:
+            if self.v_replace.get():
+                try:
+                    self._fc("captions.deleteTrack", track="C1")
+                    self.log("Removed the existing C1 caption track.")
+                except RuntimeError as exc:
+                    self.log(f"No existing C1 track to replace ({exc}).")
+            self.log(f"Sending to FilmCraft: {cmd_id} {json.dumps(params)}")
+            res = self._fc(cmd_id, **params)
+            self.log("  " + json.dumps(res, separators=(",", ":"))[:300])
+            track = "C1"
+            if isinstance(res, dict) and res.get("track") not in (None, ""):
+                track = res["track"]
+
+            if shift_s:
+                seq = self._fc("sequence.inspect")
+                fr = (seq or {}).get("settings", {}).get("frame_rate", {})
+                fps = fr.get("num", 25) / float(fr.get("den", 1) or 1)
+                lst = self._fc("captions.list", track=track)
+                ids = []
+
+                def walk(x):
+                    if isinstance(x, dict):
+                        if isinstance(x.get("id"), int) and (
+                                "text" in x or "start" in x or "startFrame" in x):
+                            ids.append(x["id"])
+                        for v in x.values():
+                            walk(v)
+                    elif isinstance(x, list):
+                        for v in x:
+                            walk(v)
+                walk(lst)
+                if ids:
+                    self._fc("captions.move", captions=ids, deltaFrames=int(round(shift_s * fps)))
+                    self.log(f"Shifted {len(ids)} captions by {shift_s:+g} s.")
+                else:
+                    self.log("Could not find caption ids to shift; captions.list said: "
+                             + json.dumps(lst)[:300])
+            if style:
+                res = self._fc("captions.setStyle", track=track, **style)
+                self.log(f"Styled track {track}: " + json.dumps(res, separators=(",", ":"))[:200])
+            self.log("Done - the captions are in FilmCraft.")
             return True
-        self.log(f"FilmCraft refused it: {reply.get('error')}")
-        self.log("Check the command's params (see 'Find caption commands') and that a sequence is open.")
+        except RuntimeError as exc:
+            self.log(f"FilmCraft refused it: {exc}")
+            self.log("Is a sequence open in FilmCraft? Is the import command right? "
+                     "(see 'Find caption commands')")
+        except OSError as exc:
+            self.log(f"Could not reach FilmCraft on {host}:{port}: {exc}")
         return False
 
     # ---- transcription ---------------------------------------------------
@@ -461,10 +728,23 @@ class App(tk.Tk):
             self.log(f"Extra arguments could not be read: {exc}")
             return None
 
+        split, vad = self.v_split.get(), self.v_vad.get()
+        try:
+            pause = float(self.v_pause.get().strip() or 0.5)
+            max_s = float(self.v_maxsec.get().strip() or 6)
+            max_c = int(float(self.v_maxchars.get().strip() or 50))
+        except ValueError:
+            self.log("Pause, Max secs and Max chars must be numbers.")
+            return None
+
         made = []
         for i, f in enumerate(files, 1):
             cmd = [exe, str(f), "--model", model, "--device", device,
-                   "--output_format", "srt", "--output_dir", str(outdir)]
+                   "--output_format", "json" if split else "srt", "--output_dir", str(outdir)]
+            if split:
+                cmd += ["--word_timestamps", "True"]
+            if vad:
+                cmd += ["--vad_filter", "True"]
             if lang:
                 cmd += ["--language", lang]
             cmd += extra
@@ -473,6 +753,23 @@ class App(tk.Tk):
             if self._run(cmd, folder) is None:  # stopped
                 return None
             srt = outdir / (f.stem + ".srt")
+            if split:  # build the SRT ourselves from the word timings
+                js = outdir / (f.stem + ".json")
+                if not js.exists() or js.stat().st_mtime < t0 - 2:
+                    self.log(f"  No .json came back for {f.name}. Check the messages above.")
+                    continue
+                try:
+                    text, n, used = words_to_srt(json.loads(js.read_text(encoding="utf-8")),
+                                                 pause, max_s, max_c)
+                except (ValueError, KeyError, TypeError) as exc:
+                    self.log(f"  Could not read the word timings in {js.name}: {exc}")
+                    continue
+                if not n:
+                    self.log(f"  Whisper heard no speech in {f.name}, so there are no captions.")
+                    continue
+                srt.write_text(text, encoding="utf-8")
+                self.log(f"  Split into {n} captions on pauses >= {pause:g} s"
+                         + ("" if used else " (no word timings found, used Whisper's own segments)"))
             if srt.exists() and srt.stat().st_mtime >= t0 - 2:
                 made.append(srt)
                 self.log(f"  SRT written: {srt}")
