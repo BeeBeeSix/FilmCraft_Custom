@@ -78,10 +78,15 @@ if "%HAVE_CLI%"=="1" if "%REG_CLAUDE_DESKTOP%"=="1" (
     echo.
     echo Updating Claude Desktop config ...
     python "%~dp0fc_desktop_cfg.py" "%FC_DIR%\%FC_CLI%" %FILMCRAFT_CONTROL_PORT% %FILMCRAFT_CONTROL_TOKEN%
-    if "%TOKEN_IS_NEW%"=="1" (
-        echo New token created. Fully quit and reopen Claude Desktop to pick it up.
+    if errorlevel 10 (
+        echo Claude Desktop config changed. Fully quit Claude Desktop from the tray and reopen it.
     ) else (
-        echo Reusing saved token - Claude Desktop does not need a restart for FilmCraft restarts.
+        if errorlevel 1 (
+            echo Claude Desktop config was NOT updated - see the message above.
+        ) else (
+            echo Claude Desktop config already up to date - no restart needed.
+            echo The keep-alive bridge reconnects by itself when FilmCraft restarts.
+        )
     )
 )
 
